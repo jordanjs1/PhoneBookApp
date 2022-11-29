@@ -1,0 +1,154 @@
+﻿using Reporting.Api.Daos;
+using Reporting.Api.Enums;
+using Reporting.Api.IntegrationEvents;
+using Reporting.Api.IntegrationEvents.Events;
+using System.Text;
+
+namespace Reporting.Api.Services;
+
+public class ReportingService : IReportingService
+{
+    private readonly IHostEnvironment _hostEnvironment;
+    private readonly IReportingIntegrationEventService _reportingIntegrationEventService;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly string _reportFilePath;
+
+    public ReportingService(IHostEnvironment hostEnvironment, IReportingIntegrationEventService reportingIntegrationEventService, IHttpClientFactory httpClientFactory)
+    {
+        _hostEnvironment = hostEnvironment;
+        _reportingIntegrationEventService = reportingIntegrationEventService;
+        _httpClientFactory = httpClientFactory;
+
+        _reportFilePath = Path.Combine(_hostEnvironment.ContentRootPath, "reports");
+    }
+
+    public async Task DoReportGenerationAsync(Guid reportId)
+    {
+        var reportCompletedEvent = new ReportCompletedIntegrationEvent
+        {
+            ReportId = reportId,
+            Status = ReportStatus.Ready
+        };
+
+        var contactInformation = await RequestContactInformationAsync();
+
+        if (contactInformation == null)
+        {
+            reportCompletedEvent.Status = ReportStatus.Failed;
+            await _reportingIntegrationEventService.PublishThroughEventBusAsync(reportCompletedEvent);
+        }
+
+        var reportFilePath = await GenerateReportFileAsync(reportId, contactInformation);
+
+        reportCompletedEvent.PathToReportFile = reportFilePath;
+
+        await _reportingIntegrationEventService.PublishThroughEventBusAsync(reportCompletedEvent);
+    }
+
+    public async Task<ICollection<ContactInformationDao>?> RequestContactInformationAsync()
+    {
+        // Here I'll be using a somewhat "spaghetti-codey" approach.
+
+        using var httpClient = _httpClientFactory.CreateClient();
+        httpClient.BaseAddress = new Uri("http://localhost:14560");
+        httpClient.Timeout = TimeSpan.FromSeconds(60);
+        
+        var httpResult = await httpClient.GetAsync("api/v1/Book/GetAllContactInformation");
+
+        if (httpResult is not { IsSuccessStatusCode: true })
+        {
+            return null;
+        }
+
+        var result = await httpResult.Content.ReadFromJsonAsync<ICollection<ContactInformationDao>>();
+
+        Console.WriteLine("Result:");
+        Console.WriteLine(result);
+
+        return result;
+
+    }
+
+    public async Task<string?> GenerateReportFileAsync(Guid reportId, ICollection<ContactInformationDao> contactInformation)
+    {
+        try
+        {
+            var reportFileLines = new StringBuilder();
+            reportFileLines.AppendLine("Location,Contact Count,Phone Number Count");
+
+            if (contactInformation.All(ci => ci.Type != ContactInformationType.Location))
+            {
+                reportFileLines.AppendLine(string.Empty);
+            }
+            else
+            {
+                var locations = contactInformation
+                    .Where(ci => ci.Type == ContactInformationType.Location)
+                    .DistinctBy(ci => ci.Content)
+                    .Select(ci => ci.Content)
+                    .ToList();
+
+                var contactsInLocations = locations.Select(location => CountContactsLocatedInLocation(contactInformation, location)).ToList();
+                var mobilePhonesInLocations = locations.Select(location => CountMobileNumbersLocatedInLocation(contactInformation, location)).ToList();
+
+                for (var i = 0; i < locations.Count; ++i)
+                {
+                    reportFileLines.AppendLine($"{locations[i]},{contactsInLocations[i]},{mobilePhonesInLocations[i]}");
+                }
+            }
+
+            return await WriteReportFileToDiskAsync(reportId, reportFileLines.ToString());
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine("Error occurred while generating the report.");
+            return null;
+        }
+    }
+
+    private static long CountContactsLocatedInLocation(IEnumerable<ContactInformationDao> contactInformation, string location)
+    {
+        return contactInformation.LongCount(ci => ci.Type == ContactInformationType.Location && ci.Content == location);
+    }
+
+    private static long CountMobileNumbersLocatedInLocation(ICollection<ContactInformationDao> contactInformation, string location)
+    {
+        return contactInformation
+            .Where(ci => ci.Type == ContactInformationType.MobileNumber)
+            .LongCount(ciWithPhone => contactInformation
+                .Any(ci => 
+                    ci.ContactId == ciWithPhone.ContactId 
+                    && ci.Type == ContactInformationType.Location 
+                    && ci.Content == location));
+
+        /* The upper code was regenerated by ReSharper from the below.
+        long result = 0;
+        var ciWithPhones = contactInformation.Where(ci => ci.Type == ContactInformationType.MobileNumber);
+
+        foreach (var ciWithPhone in ciWithPhones)
+        {
+            if (contactInformation.Any(ci =>
+                    ci.ContactId == ciWithPhone.ContactId 
+                    && ci.Type == ContactInformationType.Location 
+                    && ci.Content == location))
+            {
+                result++;
+            }
+        }
+
+        return result;
+        */
+    }
+
+    private async Task<string> WriteReportFileToDiskAsync(Guid reportId, string lines)
+    {
+        if (!Directory.Exists(_reportFilePath))
+            Directory.CreateDirectory(_reportFilePath);
+
+        var reportFilePath = Path.Combine(_reportFilePath, $"{DateTime.Now:yyyyMMdd_HHmmss}_{reportId:N}.csv");
+        await using var reportFile = File.CreateText(reportFilePath);
+        await reportFile.WriteLineAsync(lines);
+
+        return reportFilePath;
+    }
+}
